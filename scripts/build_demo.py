@@ -220,6 +220,11 @@ def main() -> None:
             if big_src.exists():
                 shutil.copy2(big_src, pdir / "thumb_big")
                 n_big += 1
+            elif thumb_src.exists():
+                # Match camwatch's server.py behavior: when no _big variant is
+                # on disk, fall through to the regular thumb so the expanded
+                # image-wrap has something to render (browser upscales).
+                shutil.copy2(thumb_src, pdir / "thumb_big")
         traj_src = events_dir / f"pass_{p.id}.jsonl"
         if traj_src.exists():
             shutil.copy2(traj_src, pdir / "trajectory.jsonl")
