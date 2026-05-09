@@ -40,6 +40,9 @@ uv run --no-project python ../camwatch-demo/scripts/build_demo.py \
 Flags:
 - `--today YYYY-MM-DD` — date-lock the snapshot (default: today, local).
 - `--days N` — how many trailing days to include (default: 2).
+- `--end YYYY-MM-DDTHH:MM:SS` — explicit exclusive upper bound. Useful for
+  excluding the most recent captures (e.g., a person on the lawn) without
+  changing the trailing-day window.
 
 Output goes to `dist/` (gitignored). Inspect locally with:
 
@@ -96,14 +99,23 @@ resolves; usually live within a few minutes.
 
 ## Daily refresh
 
-Build + deploy in one shot:
+Build + deploy in one shot. On the original author's machine the Cloudflare
+credentials live in the macOS Keychain — the global `~/.claude/CLAUDE.md`
+documents the keychain entry, so Claude Code can rebuild and redeploy on
+request without seeing the token:
 
 ```sh
+export CLOUDFLARE_API_TOKEN="$(security find-generic-password -s cf-token -a claude -w)"
+export CLOUDFLARE_ACCOUNT_ID=b10e21f6d7d6d6344afa5e5f86def18e
+
 cd ../camwatch && uv run --no-project python \
     ../camwatch-demo/scripts/build_demo.py --source . --out ../camwatch-demo/dist
 cd ../camwatch-demo && npx wrangler@latest pages deploy dist \
     --project-name camwatch-demo --branch main --commit-dirty=true
 ```
+
+Add `--end 2026-05-09T14:23:51` (or any cutoff) to the build command if you
+need to exclude the most recent captures.
 
 ## How it works
 
