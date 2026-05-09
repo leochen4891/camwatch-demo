@@ -146,10 +146,36 @@ def main() -> None:
         **heatmap_ctx,
     }
 
-    index_html = env.get_template("index.html").render(**common_ctx)
+    # Index inlines _pass_list.html via Jinja {% include %}. Disable the
+    # OOB histogram/heatmap there to avoid duplicate IDs (the sidebar already
+    # renders them once); the standalone passes.html — the response HTMX would
+    # have swapped in — keeps them on for completeness even though our client
+    # filter intercepts the request.
+    index_ctx = {**common_ctx, "include_oob_histogram": False, "include_oob_heatmap": False}
+    index_html = env.get_template("index.html").render(**index_ctx)
     pass_list_html = env.get_template("_pass_list.html").render(**common_ctx)
 
-    index_html = patch_index_html(index_html, latest_thumb_url="/preview/stream", today=today, n_passes=len(rendered))
+    # Per-pass metadata for the client-side filter engine. Keys are short to
+    # keep the inline JSON small (~30 KB for 700 rows).
+    week_start, _ = cw_server._week_window(today)
+    passes_meta = {}
+    for r in rendered:
+        mph = r.get("computed_mph")
+        passes_meta[str(r["id"])] = {
+            "d": r["direction"],
+            "m": float(mph) if mph is not None and mph > 0 else None,
+            "a": 1 if r.get("alert") else 0,
+            "b": cw_server._bucket_for(mph) if mph is not None and mph > 0 else None,
+            "s": cw_server._slot_index_for(r["captured_at"], week_start),
+        }
+
+    index_html = patch_index_html(
+        index_html,
+        latest_thumb_url="/preview/stream",
+        today=today,
+        n_passes=len(rendered),
+        passes_meta=passes_meta,
+    )
 
     (out / "index.html").write_text(index_html)
     # Cloudflare Pages resolves /passes -> passes.html, while /passes/{id}/clip
@@ -230,12 +256,12 @@ def main() -> None:
     status_badge_html = env.get_template("_status_badge.html").render(running=False, paused_night=False)
     (out / "status-badge").write_text(status_badge_html)
 
-    # --- preview/stream as a still JPG -----------------------------------
+    # --- preview/stream as a still JPG, with "Static Preview" burned in ---
     preview_dir = out / "preview"
     preview_dir.mkdir(parents=True, exist_ok=True)
     if latest_thumb is not None:
-        shutil.copy2(latest_thumb, preview_dir / "stream")
-        print(f"wrote: preview/stream from {latest_thumb.name}")
+        write_preview_with_overlay(latest_thumb, preview_dir / "stream")
+        print(f"wrote: preview/stream from {latest_thumb.name} (with overlay)")
     else:
         print("warning: no thumb found for preview/stream")
 
@@ -272,15 +298,70 @@ def main() -> None:
     print(f"\ndone: {total_files} files, {total_bytes / 1e6:.1f} MB in {out}")
 
 
+# --- preview overlay ------------------------------------------------------
+
+def write_preview_with_overlay(src: Path, dst: Path) -> None:
+    """Burn a 'STATIC PREVIEW' label into the JPG so the side note isn't needed.
+
+    Uses cv2 (already a camwatch dep) to draw a translucent dark band across
+    the top with white sans-serif text.
+    """
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+
+    img = cv2.imread(str(src), cv2.IMREAD_COLOR)
+    if img is None:
+        # Fallback: just copy the file unchanged.
+        shutil.copy2(src, dst)
+        return
+    h, w = img.shape[:2]
+    text = "STATIC PREVIEW"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.4, w / 640.0 * 0.7)
+    thickness = max(1, int(round(scale * 2)))
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    pad_x, pad_y = int(scale * 12), int(scale * 8)
+    band_h = th + baseline + pad_y * 2
+
+    # Translucent dark band across the top.
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, 0), (w, band_h), (0, 0, 0), thickness=cv2.FILLED)
+    cv2.addWeighted(overlay, 0.55, img, 0.45, 0, dst=img)
+
+    # White text, centered horizontally.
+    tx = (w - tw) // 2
+    ty = pad_y + th
+    cv2.putText(img, text, (tx, ty), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    # Encode to JPEG bytes manually: cv2.imwrite picks the codec by extension,
+    # but our destination is extensionless (Cloudflare Pages routes /preview/stream
+    # to this file with content-type set via _headers).
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if not ok:
+        shutil.copy2(src, dst)
+        return
+    dst.write_bytes(buf.tobytes())
+
+
 # --- index.html patches ---------------------------------------------------
 
-def patch_index_html(html: str, *, latest_thumb_url: str, today: date, n_passes: int) -> str:
+def patch_index_html(
+    html: str,
+    *,
+    latest_thumb_url: str,
+    today: date,
+    n_passes: int,
+    passes_meta: dict,
+) -> str:
     """Patch the rendered index.html for the static demo:
       1. Replace ?big=1 query string with the _big path suffix (CF Pages
          ignores query strings during file lookup).
-      2. Inject a top banner explaining this is a read-only demo.
+      2. Inject a top banner.
       3. Replace the live preview <img> with a still + note.
-      4. Inject a JS shim that intercepts htmx POSTs and shows a toast.
+      4. Inject a toast shim that intercepts htmx POSTs.
+      5. Inject window.PASSES metadata + a client-side filter engine that
+         takes over the existing htmx GET requests.
+      6. Strip the form's "every 10s" auto-refresh (no live data to fetch).
     """
     # 1. ?big=1 → _big
     html = html.replace("/thumb?big=1", "/thumb_big")
@@ -290,7 +371,7 @@ def patch_index_html(html: str, *, latest_thumb_url: str, today: date, n_passes:
 <div id="demo-banner" style="background:#1a4ed8;color:#fff;padding:8px 14px;font:14px/1.4 system-ui,sans-serif;text-align:center;">
   <strong>camwatch · public read-only snapshot</strong> ·
   showing {n_passes} captures from {(today - timedelta(days=1)).isoformat()} to {today.isoformat()} ·
-  filters and write actions are inert · live source at
+  filters work locally, write actions are no-ops · live source at
   <a href="https://camwatch.leidevs.com/" style="color:#fff;text-decoration:underline;">camwatch.leidevs.com</a>
   · code at
   <a href="https://github.com/leochen4891/camwatch" style="color:#fff;text-decoration:underline;">github.com/leochen4891/camwatch</a>
@@ -298,17 +379,22 @@ def patch_index_html(html: str, *, latest_thumb_url: str, today: date, n_passes:
 """
     html = html.replace("<body>", "<body>\n" + banner, 1)
 
-    # 3. Live preview pane — swap the empty <img> for the static still + note.
+    # 6. Strip auto-refresh — leave "change" so client filter still triggers.
+    html = html.replace(
+        'hx-trigger="change, every 10s"',
+        'hx-trigger="change"',
+    )
+
+    # 3. Live preview pane — swap the empty <img> for the static still (the
+    # "Static Preview" label is burned into the JPG itself, so no side text).
     # Also neutralize the runtime's src-removal logic (the upstream UI strips
     # the src when hidden to halt the MJPEG stream — we want the still to
     # persist) and default the preview to "visible" so the snapshot shows on
     # first paint without the user clicking "show".
     preview_old = '<img alt="live preview" id="preview-img">'
     preview_new = (
-        f'<img alt="snapshot of last captured frame" id="preview-img" src="{latest_thumb_url}">'
-        '<p class="demo-preview-note" style="margin:6px 0 0;font:12px/1.4 system-ui;color:#666;">'
-        'Static still from the most recent capture. Live MJPEG isn\'t part of this demo.'
-        '</p>'
+        f'<img alt="static snapshot of last captured frame" '
+        f'id="preview-img" src="{latest_thumb_url}">'
     )
     html = html.replace(preview_old, preview_new)
     html = html.replace(
@@ -358,7 +444,169 @@ def patch_index_html(html: str, *, latest_thumb_url: str, today: date, n_passes:
 """
     html = html.replace("</body>", shim + "</body>", 1)
 
+    # 5. Per-pass metadata + client-side filter engine.
+    meta_json = json.dumps(passes_meta, separators=(",", ":"))
+    filter_engine = (
+        '<script>window.PASSES = ' + meta_json + ';</script>\n' + FILTER_ENGINE_JS
+    )
+    html = html.replace("</body>", filter_engine + "</body>", 1)
+
     return html
+
+
+# Client-side filter engine. Intercepts htmx GETs to /passes (or /status-badge)
+# and replaces them with a local recompute over window.PASSES. Re-runs on
+# DOMContentLoaded once so restored localStorage state takes effect.
+FILTER_ENGINE_JS = r"""<script>
+(function () {
+  const SLOTS_PER_DAY = 32;
+  const TOTAL_SLOTS = 224;
+
+  function readState() {
+    const f = document.getElementById("filter-form");
+    const dir = f?.querySelector('[name="direction"]')?.value || "";
+    const alertsOnly = !!f?.querySelector('[name="alerts_only"]')?.checked;
+    const buckets = new Set(
+      Array.from(document.querySelectorAll('#histogram input[name="buckets"]:checked'))
+        .map((c) => parseInt(c.value, 10))
+    );
+    const totalBuckets = document.querySelectorAll('#histogram input[name="buckets"]').length;
+    const allBuckets = buckets.size === 0 || buckets.size === totalBuckets;
+    const maskInput = document.getElementById("time-mask");
+    const maskStr = maskInput ? maskInput.value : "";
+    const slots = maskStr.length === TOTAL_SLOTS
+      ? Array.from(maskStr, (c) => c === "1")
+      : new Array(TOTAL_SLOTS).fill(true);
+    const allSlots = slots.every((b) => b);
+    return { dir, alertsOnly, buckets, allBuckets, slots, allSlots };
+  }
+
+  function applyFilters() {
+    const st = readState();
+    const PASSES = window.PASSES || {};
+    const bucketCounts = new Array(11).fill(0);
+    const slotCount = new Array(TOTAL_SLOTS).fill(0);
+    const slotSum = new Array(TOTAL_SLOTS).fill(0);
+    const slotValid = new Array(TOTAL_SLOTS).fill(0);
+    const slotTop = new Array(TOTAL_SLOTS).fill(null);
+    let visible = 0;
+
+    document.querySelectorAll('#pass-list article.pass-row').forEach((row) => {
+      const id = row.id.replace('pass-', '');
+      const m = PASSES[id];
+      if (!m) { row.style.display = ''; return; }
+      let show = true;
+      if (st.dir && m.d !== st.dir) show = false;
+      if (st.alertsOnly && !m.a) show = false;
+      if (!st.allBuckets && (m.b == null || !st.buckets.has(m.b))) show = false;
+      if (!st.allSlots && (m.s == null || !st.slots[m.s])) show = false;
+      row.style.display = show ? '' : 'none';
+      if (show) {
+        visible++;
+        if (m.b != null) bucketCounts[m.b]++;
+        if (m.s != null) {
+          slotCount[m.s]++;
+          if (m.m != null) {
+            slotSum[m.s] += m.m;
+            slotValid[m.s]++;
+            if (slotTop[m.s] == null || m.m > slotTop[m.s]) slotTop[m.s] = m.m;
+          }
+        }
+      }
+    });
+
+    updateHistogram(bucketCounts, visible);
+    updateHeatmap(slotCount, slotSum, slotValid, slotTop);
+    updateEmptyState(visible);
+  }
+
+  function updateHistogram(counts, total) {
+    const max = Math.max.apply(null, counts) || 1;
+    const wraps = document.querySelectorAll('#histogram .bar-wrap');
+    wraps.forEach((wrap, idx) => {
+      const c = counts[idx] || 0;
+      const pct = Math.round((c / max) * 100);
+      const bar = wrap.querySelector('.bar');
+      const lbl = wrap.querySelector('.bar-count');
+      if (bar) bar.style.height = pct + '%';
+      if (lbl) lbl.textContent = c ? String(c) : '';
+      const baseTitle = (wrap.title || '').split(':')[0];
+      if (baseTitle) wrap.title = baseTitle + ': ' + c;
+    });
+    const titleSpan = document.querySelector('#histogram .histogram-title .muted');
+    if (titleSpan) titleSpan.textContent = '(' + total + ' pass' + (total === 1 ? '' : 'es') + ')';
+  }
+
+  function heatClass(c, max) {
+    if (c <= 0 || max <= 0) return 0;
+    const ratio = Math.sqrt(c / max);
+    return Math.min(5, Math.max(1, Math.floor(ratio * 5 + 0.999)));
+  }
+
+  function heatClassSpeed(avg, minA, maxA) {
+    if (avg == null || avg <= 0 || maxA <= 0) return 0;
+    if (maxA <= minA) return 3;
+    const ratio = (avg - minA) / (maxA - minA);
+    return Math.min(5, Math.max(1, Math.floor(ratio * 5 + 0.999)));
+  }
+
+  function updateHeatmap(counts, sums, valid, tops) {
+    const maxCount = Math.max.apply(null, counts) || 0;
+    const avgs = counts.map((_, i) => valid[i] > 0 ? sums[i] / valid[i] : null);
+    const validAvgs = avgs.filter((a) => a != null);
+    const minAvg = validAvgs.length ? Math.min.apply(null, validAvgs) : 0;
+    const maxAvg = validAvgs.length ? Math.max.apply(null, validAvgs) : 0;
+    const mode = document.getElementById('heatmap')?.classList.contains('mode-speed') ? 'speed' : 'count';
+
+    document.querySelectorAll('#heatmap .heatmap-cell').forEach((cell) => {
+      const i = parseInt(cell.dataset.index, 10);
+      const c = counts[i] || 0;
+      const hC = heatClass(c, maxCount);
+      const hS = heatClassSpeed(avgs[i], minAvg, maxAvg);
+      cell.dataset.heatCount = String(hC);
+      cell.dataset.heatSpeed = String(hS);
+      cell.dataset.count = String(c);
+      const heat = mode === 'speed' ? hS : hC;
+      cell.classList.remove('heat-0', 'heat-1', 'heat-2', 'heat-3', 'heat-4', 'heat-5');
+      cell.classList.add('heat-' + heat);
+    });
+  }
+
+  function updateEmptyState(visible) {
+    const list = document.getElementById('pass-list');
+    if (!list) return;
+    let empty = list.querySelector('.empty');
+    if (visible === 0) {
+      if (!empty) {
+        empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = 'No passes match these filters.';
+        list.appendChild(empty);
+      }
+      empty.style.display = '';
+    } else if (empty) {
+      empty.style.display = 'none';
+    }
+  }
+
+  // Intercept htmx GETs to /passes and /status-badge — they have no live
+  // backend, so just run the local filter (or do nothing for the badge).
+  document.body.addEventListener('htmx:beforeRequest', function (evt) {
+    const path = evt.detail?.requestConfig?.path || '';
+    if (path.startsWith('/passes') || path.startsWith('/status-badge')) {
+      evt.preventDefault();
+      if (path.startsWith('/passes')) applyFilters();
+    }
+  });
+
+  document.addEventListener('DOMContentLoaded', function () {
+    // Slight delay so the upstream DOMContentLoaded handlers (which restore
+    // localStorage state into the form / histogram / heatmap inputs) run first.
+    setTimeout(applyFilters, 0);
+  });
+})();
+</script>
+"""
 
 
 if __name__ == "__main__":
