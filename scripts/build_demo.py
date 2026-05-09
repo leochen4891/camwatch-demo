@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="dist", help="output dir for static site")
     p.add_argument("--today", default=None, help="YYYY-MM-DD; default = today (local)")
     p.add_argument("--days", type=int, default=2, help="number of days to include (default 2 = today+yesterday)")
+    p.add_argument("--end", default=None, help="exclusive upper bound, ISO datetime (overrides today+1)")
     return p.parse_args()
 
 
@@ -63,7 +64,10 @@ def main() -> None:
     db = Database(source / "camwatch.db")
 
     span_start_dt = datetime.combine(today - timedelta(days=args.days - 1), datetime.min.time())
-    span_end_dt = datetime.combine(today + timedelta(days=1), datetime.min.time())
+    if args.end:
+        span_end_dt = datetime.fromisoformat(args.end)
+    else:
+        span_end_dt = datetime.combine(today + timedelta(days=1), datetime.min.time())
     span_start_iso = span_start_dt.isoformat(timespec="seconds")
     span_end_iso = span_end_dt.isoformat(timespec="seconds")
     print(f"window: [{span_start_iso}, {span_end_iso})")
