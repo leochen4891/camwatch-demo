@@ -4,13 +4,13 @@ Static snapshot of [camwatch](https://github.com/leochen4891/camwatch) for publi
 Live at **https://camwatch-demo.leidevs.com/**.
 
 The live camwatch service is behind Cloudflare Access; this demo lets anyone
-poke at the UI without an account by baking a 2-day window of real captures
+poke at the UI without an account by baking a 3-day window of real captures
 into a fully static site on Cloudflare Pages.
 
 ## What it ships
 
-- The camwatch index page rendered once, with the most recent two days of
-  passes (~700, ~210 MB of clips + thumbs + per-pass trajectory JSONL).
+- The camwatch index page rendered once, with the most recent three days of
+  passes baked in (clips + thumbs + per-pass trajectory JSONL).
 - The same per-pass speed chart, grid overlay, video player, heatmap, and
   histogram as the live UI.
 - A demo banner across the top; filter changes and write actions (annotate /
@@ -39,7 +39,7 @@ uv run --no-project python ../camwatch-demo/scripts/build_demo.py \
 
 Flags:
 - `--today YYYY-MM-DD` — date-lock the snapshot (default: today, local).
-- `--days N` — how many trailing days to include (default: 2).
+- `--days N` — how many trailing days to include (default: 3).
 - `--end YYYY-MM-DDTHH:MM:SS` — explicit exclusive upper bound. Useful for
   excluding the most recent captures (e.g., a person on the lawn) without
   changing the trailing-day window.

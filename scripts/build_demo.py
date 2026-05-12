@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--source", default="../camwatch", help="path to camwatch checkout")
     p.add_argument("--out", default="dist", help="output dir for static site")
     p.add_argument("--today", default=None, help="YYYY-MM-DD; default = today (local)")
-    p.add_argument("--days", type=int, default=2, help="number of days to include (default 2 = today+yesterday)")
+    p.add_argument("--days", type=int, default=3, help="number of days to include (default 3 = today + 2 days back)")
     p.add_argument("--end", default=None, help="exclusive upper bound, ISO datetime (overrides today+1)")
     return p.parse_args()
 
@@ -58,7 +58,7 @@ def main() -> None:
     from camwatch.db import Database  # type: ignore
 
     cw_server._today_local = lambda: today  # date-lock for heatmap/window math
-    cw_server.PAGE_SIZE = 10000             # one page contains all 2-day rows
+    cw_server.PAGE_SIZE = 10000             # one page contains all rows in the window
 
     cfg = load_config(source / "config" / "config.yaml")
     db = Database(source / "camwatch.db")
@@ -130,7 +130,8 @@ def main() -> None:
         "static_v": static_v,
         "rows": rendered,
         "threshold": threshold,
-        "retention_days": cfg.retention_days,
+        "recordings_days": cfg.recordings_days,
+        "passes_days": cfg.passes_days,
         "clip_margin_s": cfg.clip_margin_s,
         "clip_capture_min_mph": cfg.clip_capture_min_mph,
         "clip_capture_max_mph": cfg.clip_capture_max_mph,
@@ -171,12 +172,16 @@ def main() -> None:
             "a": 1 if r.get("alert") else 0,
             "b": cw_server._bucket_for(mph) if mph is not None and mph > 0 else None,
             "s": cw_server._slot_index_for(r["captured_at"], week_start),
+            "vmk": r.get("vehicle_make"),
+            "vmd": r.get("vehicle_model"),
+            "vc":  r.get("vehicle_color"),
         }
 
     index_html = patch_index_html(
         index_html,
         latest_thumb_url="/preview/stream",
         today=today,
+        span_days=args.days,
         n_passes=len(rendered),
         passes_meta=passes_meta,
     )
@@ -359,6 +364,7 @@ def patch_index_html(
     *,
     latest_thumb_url: str,
     today: date,
+    span_days: int,
     n_passes: int,
     passes_meta: dict,
 ) -> str:
@@ -379,7 +385,7 @@ def patch_index_html(
     banner = f"""\
 <div id="demo-banner" style="background:#1a4ed8;color:#fff;padding:8px 14px;font:14px/1.4 system-ui,sans-serif;text-align:center;">
   <strong>camwatch · public read-only snapshot</strong> ·
-  showing {n_passes} captures from {(today - timedelta(days=1)).isoformat()} to {today.isoformat()} ·
+  showing {n_passes} captures from {(today - timedelta(days=span_days - 1)).isoformat()} to {today.isoformat()} ·
   filters work locally, write actions are no-ops · live source at
   <a href="https://camwatch.leidevs.com/" style="color:#fff;text-decoration:underline;">camwatch.leidevs.com</a>
   · code at
@@ -469,7 +475,19 @@ def patch_index_html(
 FILTER_ENGINE_JS = r"""<script>
 (function () {
   const SLOTS_PER_DAY = 32;
-  const TOTAL_SLOTS = 224;
+  const TOTAL_SLOTS = 256;  // 8 days × 32 slots/day (matches server DAYS_IN_WEEK)
+
+  // Mirror of server-side COLOR_MATCHES in camwatch/server.py — keep in sync.
+  const COLOR_MATCHES = {
+    light:  ["light", "yellow", "grey"],
+    grey:   ["grey", "light", "dark"],
+    dark:   ["dark", "grey"],
+    red:    ["red", "brown"],
+    blue:   ["blue", "dark", "grey"],
+    green:  ["green", "brown"],
+    brown:  ["brown", "red", "yellow"],
+    yellow: ["yellow", "light", "brown"],
+  };
 
   function readState() {
     const f = document.getElementById("filter-form");
@@ -487,7 +505,11 @@ FILTER_ENGINE_JS = r"""<script>
       ? Array.from(maskStr, (c) => c === "1")
       : new Array(TOTAL_SLOTS).fill(true);
     const allSlots = slots.every((b) => b);
-    return { dir, alertsOnly, buckets, allBuckets, slots, allSlots };
+    const vMake  = (document.getElementById("vehicle-make")?.value  || "").trim();
+    const vModel = (document.getElementById("vehicle-model")?.value || "").trim();
+    const vColor = (document.getElementById("vehicle-color")?.value || "").trim();
+    const colorAllowed = vColor ? new Set(COLOR_MATCHES[vColor] || [vColor]) : null;
+    return { dir, alertsOnly, buckets, allBuckets, slots, allSlots, vMake, vModel, vColor, colorAllowed };
   }
 
   function applyFilters() {
@@ -509,6 +531,9 @@ FILTER_ENGINE_JS = r"""<script>
       if (st.alertsOnly && !m.a) show = false;
       if (!st.allBuckets && (m.b == null || !st.buckets.has(m.b))) show = false;
       if (!st.allSlots && (m.s == null || !st.slots[m.s])) show = false;
+      if (st.vMake  && m.vmk !== st.vMake)   show = false;
+      if (st.vModel && m.vmd !== st.vModel)  show = false;
+      if (st.colorAllowed && !st.colorAllowed.has(m.vc)) show = false;
       row.style.display = show ? '' : 'none';
       if (show) {
         visible++;
@@ -527,6 +552,36 @@ FILTER_ENGINE_JS = r"""<script>
     updateHistogram(bucketCounts, visible);
     updateHeatmap(slotCount, slotSum, slotValid, slotTop);
     updateEmptyState(visible);
+    updateVehicleChip(st);
+  }
+
+  function updateVehicleChip(st) {
+    const list = document.getElementById('pass-list');
+    if (!list) return;
+    let chip = list.querySelector('.vehicle-filter-chip');
+    const active = !!(st.vMake || st.vModel || st.vColor);
+    if (active) {
+      if (!chip) {
+        chip = document.createElement('div');
+        chip.className = 'vehicle-filter-chip';
+        list.insertBefore(chip, list.firstChild);
+      }
+      const parts = [];
+      if (st.vMake)  parts.push('<strong>' + st.vMake + '</strong>');
+      if (st.vModel) parts.push('<strong>' + st.vModel + '</strong>');
+      if (st.vColor) parts.push('<span class="muted">(' + st.vColor + ')</span>');
+      chip.innerHTML = 'Filter: ' + parts.join(' ') +
+        ' <button type="button" class="chip-clear" title="Clear vehicle filter">×</button>';
+      chip.querySelector('.chip-clear').addEventListener('click', function () {
+        document.getElementById('vehicle-make').value = '';
+        document.getElementById('vehicle-model').value = '';
+        document.getElementById('vehicle-color').value = '';
+        if (typeof saveFilterState === 'function') saveFilterState();
+        applyFilters();
+      });
+    } else if (chip) {
+      chip.remove();
+    }
   }
 
   function updateHistogram(counts, total) {
