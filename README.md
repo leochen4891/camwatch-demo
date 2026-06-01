@@ -1,5 +1,11 @@
 # camwatch-demo
 
+> **Archived and no longer maintained.** This public demo is retired. The
+> camwatch service is now hosted on Cloudflare with login control, so a
+> separate no-account demo is no longer needed. The live deployment
+> (`camwatch-demo.leidevs.com`) and its Cloudflare Pages project have been
+> removed. The notes below are kept for reference only.
+
 Static snapshot of [camwatch](https://github.com/leochen4891/camwatch) for public demo.
 Live at **https://camwatch-demo.leidevs.com/**.
 
